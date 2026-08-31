@@ -1,0 +1,1664 @@
+clc; clear; close all;
+
+%% ========================================================================
+% FEATURE TOGGLES 
+% =========================================================================
+
+Default_Flags.Use_Data_Cursor    = false;
+Default_Flags.Use_Dashboard      = false;
+Default_Flags.Use_Live_Animation = false;
+Default_Flags.Use_LOS_Shading    = false;
+Default_Flags.Camera_Follow      = false;
+Default_Flags.Use_STL_Models     = false;
+Default_Flags.Run_Batch_Tuning   = false;
+Default_Flags.Use_3D_View        = false;
+
+if isfile('SimFlags.mat')
+    load('SimFlags.mat', 'Flags');
+
+    Default_Field_Names = fieldnames(Default_Flags);
+    for fi = 1:length(Default_Field_Names)
+        if ~isfield(Flags, Default_Field_Names{fi})
+            Flags.(Default_Field_Names{fi}) = Default_Flags.(Default_Field_Names{fi});
+        end
+    end
+else
+    Flags = Default_Flags;
+end
+
+Flags = FlagToggleGUI(Flags);
+
+%% ========================================================================
+% SECTION 1: PARAMETERS
+% =========================================================================
+
+Delta_Time              = 0.05;
+Plane_Heading           = rand * 2*pi;
+Plane_Max_Turn_Rate     = pi/1.5;
+Plane_Noise_Weight      = 0.15;
+Plane_Start             = randi([0, 1200], 2, 1);
+Close_Range             = 250.0;
+Jink_Period             = 4.5;
+Missile_Start           = [0; 0];
+Missile_Boundary_Margin = 60.0;
+Missile_Boundary_Gain   = 500.0;
+Boundary_Margin         = 80.0;
+Gain_Repulsive          = 500.0;
+Influence_Radius        = 60.0;
+Arena_Buffer            = 50;
+Replay_Speed            = 1.0;
+Animation_Step          = 3;
+
+Settings = SimulationSetupGUI(20.0, 40.0, 100.0, 10, 35, 20.0);
+
+Plane_Speed    = Settings.Plane_Speed;
+Missile_Speed  = Settings.Missile_Speed;
+Max_Time       = Settings.Max_Time;
+Num_Obstacles  = round(Settings.Num_Obstacles);
+Missile_G_Max  = Settings.Missile_G_Max;
+Capture_Radius = Settings.Capture_Radius;
+Arena_Z_Max = 500;
+
+% --- Pack params for batch tuning (must be after all values are defined) ---
+Params.Delta_Time              = Delta_Time;
+Params.Plane_Heading           = Plane_Heading;
+Params.Plane_Max_Turn_Rate     = Plane_Max_Turn_Rate;
+Params.Plane_Noise_Weight      = Plane_Noise_Weight;
+Params.Close_Range             = Close_Range;
+Params.Jink_Period             = Jink_Period;
+Params.Missile_Start           = Missile_Start;
+Params.Missile_Boundary_Margin = Missile_Boundary_Margin;
+Params.Missile_Boundary_Gain   = Missile_Boundary_Gain;
+Params.Boundary_Margin         = Boundary_Margin;
+Params.Gain_Repulsive          = Gain_Repulsive;
+Params.Influence_Radius        = Influence_Radius;
+Params.Arena_Buffer            = Arena_Buffer;
+Params.Min_Separation          = 150;
+
+% Arena Size
+Initial_Separation     = norm(Plane_Start - Missile_Start);
+Closing_Speed_Estimate = Missile_Speed - Plane_Speed;
+if Closing_Speed_Estimate <= 0
+    error('Missile speed must exceed plane speed.');
+end
+
+Missile_Model_File = 'AIM-120A_AMRAAM_MODEL.stl';
+Model_Scale.Missile          = .5;
+Model_Heading_Offset.Missile = 0;
+Plane_Model_File = 'F16_BLOCK50_MODEL.stl';
+Model_Scale.Plane          = .5;    
+Model_Heading_Offset.Plane = pi;      
+SAM_Model_File = 'PATRIOT_PAC3_MODEL.stl';
+Model_Scale.SAM = 10;          
+Model_Heading_Offset.SAM = 0;   
+SAM_Position = Missile_Start;
+SAM_Heading = 0;
+Model_Axis_Order.Missile = [3 1 2];
+Model_Axis_Order.Plane   = [2 1 3];
+Model_Pre_Rotation.Missile = [-pi/2, 0, 0];
+Model_Pre_Rotation.Plane = [0, 0, 0];
+
+if Flags.Use_STL_Models
+    % Missile STL
+    STL = stlread(Missile_Model_File);
+    Missile_Vertices = STL.Points;
+    Missile_Faces    = STL.ConnectivityList;
+    Missile_Vertices = Missile_Vertices - mean(Missile_Vertices, 1);
+
+    % Plane STL
+    STL = stlread(Plane_Model_File);
+    Plane_Vertices = STL.Points;
+    Plane_Faces    = STL.ConnectivityList;
+    Plane_Vertices = Plane_Vertices - mean(Plane_Vertices, 1);
+    Model_Heading_Offset.Plane = pi;
+
+    % SAM / PAC-3 STL
+    STL = stlread(SAM_Model_File);
+    SAM_Vertices = STL.Points;
+    SAM_Faces    = STL.ConnectivityList;
+    SAM_Vertices = SAM_Vertices - mean(SAM_Vertices, 1);
+end
+
+
+
+if Flags.Use_STL_Models
+    fprintf('STL size: X=%.1f  Y=%.1f  Z=%.1f\n', max(Missile_Vertices(:,1)) - min(Missile_Vertices(:,1)), max(Missile_Vertices(:,2)) - min(Missile_Vertices(:,2)), max(Missile_Vertices(:,3)) - min(Missile_Vertices(:,3)));
+end
+
+Estimated_Intercept_Time = Initial_Separation / Closing_Speed_Estimate;
+Arena_Size = ceil(max([Missile_Start; Plane_Start])) + ceil(max(Missile_Speed, Plane_Speed) * Estimated_Intercept_Time) + Arena_Buffer;
+
+%% ========================================================================
+% SECTION 2: GENERATE RANDOM OBSTACLES
+% =========================================================================
+
+
+Obs_Radius_Min = 5;
+Obs_Radius_Max = 50;
+rng('shuffle');
+
+Obstacle_Center = zeros(3, Num_Obstacles);
+Obstacle_Radius = zeros(1, Num_Obstacles);
+Clearance = 20.0;
+Count     = 0;
+Attempts  = 0;
+
+while Count < Num_Obstacles && Attempts < 5000
+    Attempts = Attempts + 1;
+
+    R  = Obs_Radius_Min + (Obs_Radius_Max - Obs_Radius_Min) * rand();
+    Cx = R + (Arena_Size - 2*R) * rand();
+    Cy = R + (Arena_Size - 2*R) * rand();
+
+    if Flags.Use_3D_View
+        Cz = R + (Arena_Z_Max - 2*R) * rand();
+    else
+        Cz = 0;
+    end
+
+    C = [Cx; Cy; Cz];
+
+    if norm(C(1:2) - Missile_Start) < Clearance + R, continue; end
+    if norm(C(1:2) - Plane_Start) < Clearance + R, continue; end
+
+    Overlap = false;
+    for k = 1:Count
+        if norm(C(1:2) - Obstacle_Center(1:2,k)) < R + Obstacle_Radius(k) + 4
+            Overlap = true; break;
+        end
+    end
+    if Overlap, continue; end
+
+    Count = Count + 1;
+    Obstacle_Center(:, Count) = C;
+    Obstacle_Radius(Count)    = R;
+end
+
+Num_Obstacles = Count;
+fprintf('Placed %d obstacles.\n', Num_Obstacles);
+
+%% ========================================================================
+% SECTION 3: INITIALISE STATE
+% =========================================================================
+
+Missile_Position  = Missile_Start;
+Plane_Position    = Plane_Start;
+Plane_Velocity    = Plane_Speed * [cos(Plane_Heading); sin(Plane_Heading)];
+Plane_Noise_Angle = 0.0;
+Smoothed_Evasion = [cos(Plane_Heading); sin(Plane_Heading)];
+Missile_Z = 0;
+Plane_Z   = 50 + 350 * rand();
+Plane_Z_Velocity = -10 + 20 * rand();
+Plane_Z_Max_Accel = 12;
+Missile_Z_Velocity = 0;
+Missile_Z_Max_Accel = 8;
+Missile_Z_Max_Speed = 35;
+
+Initial_Vector  = Plane_Start - Missile_Start;
+Missile_Heading = atan2(Initial_Vector(2), Initial_Vector(1));
+
+Last_Plane_Position = Plane_Position;
+Last_Plane_Velocity = Plane_Velocity;
+Occlusion_Timer     = 0.0;
+
+Max_Steps       = ceil(Max_Time / Delta_Time);
+Log_Missile_X   = nan(1, Max_Steps);
+Log_Missile_Y   = nan(1, Max_Steps);
+Log_Plane_X     = nan(1, Max_Steps);
+Log_Plane_Y     = nan(1, Max_Steps);
+Log_Distance    = nan(1, Max_Steps);
+Log_Time        = nan(1, Max_Steps);
+Log_LOS_Blocked = false(1, Max_Steps);
+Log_Missile_G   = nan(1, Max_Steps);
+
+%% ========================================================================
+% SECTION 4: MAIN SIMULATION LOOP
+% =========================================================================
+
+Step         = 0;
+Current_Time = 0.0;
+Intercept    = false;
+Keep_Running = true;
+
+if Flags.Use_Live_Animation
+    Sim_Fig = figure('Name', 'Live Simulation', 'Color', 'k');
+    hold on; grid on;
+    axis normal;
+    pbaspect([1 1 0.45]);
+    if Flags.Use_3D_View
+        view(3);
+        zlabel('Z (m)');
+        zlim([0 Arena_Z_Max]);
+    else
+        view(2);
+    end
+    lighting gouraud
+    camlight('headlight')
+    material dull
+
+    set(gca, 'Color', [0.05 0.05 0.05]);
+    set(gca, 'GridColor', [0.5 0.5 0.5]);
+    xlabel('X (m)');
+    ylabel('Y (m)');
+    title('Live Intercept Simulation');
+    xlim([0 Arena_Size]);
+    ylim([0 Arena_Size]);
+
+    if Flags.Use_3D_View
+        zlim([0 Arena_Z_Max]);
+    end
+
+    for i = 1:Num_Obstacles
+        if Flags.Use_3D_View
+            [Xs, Ys, Zs] = sphere(24);
+            surf(Obstacle_Center(1,i) + Obstacle_Radius(i)*Xs, Obstacle_Center(2,i) + Obstacle_Radius(i)*Ys, Obstacle_Center(3,i) + Obstacle_Radius(i)*Zs, 'FaceColor', [0.75 0.75 0.75], 'EdgeColor', 'none', 'FaceAlpha', 0.55);
+        else
+            th = linspace(0, 2*pi, 60);
+            fill(Obstacle_Center(1,i) + Obstacle_Radius(i)*cos(th), Obstacle_Center(2,i) + Obstacle_Radius(i)*sin(th), [0.75 0.75 0.75], 'EdgeColor', [0.5 0.5 0.5]);
+        end
+    end
+
+    Missile_Trail = animatedline('Color', [0.0 0.6 0.8], 'LineWidth', 1.2);
+    Plane_Trail   = animatedline('Color', 'y', 'LineWidth', 2.0);
+    LOS_Line      = plot3([0 0], [0 0], [0 0], 'g-', 'LineWidth', 1);
+
+    Missile_Marker = plot3(Missile_Position(1), Missile_Position(2), 0, 'co', 'MarkerFaceColor', 'c', 'MarkerSize', 8, 'Visible', 'off');
+    Plane_Marker   = plot3(Plane_Position(1),   Plane_Position(2),   0, 'y^', 'MarkerFaceColor', 'y', 'MarkerSize', 8, 'Visible', 'off');
+
+    if Flags.Use_STL_Models
+        
+        Missile_Model = patch('Faces', Missile_Faces, 'Vertices', TransformSTL3D( Missile_Vertices, [Missile_Position(1); Missile_Position(2); 0], Missile_Heading + Model_Heading_Offset.Missile, Model_Scale.Missile, Model_Axis_Order.Missile, Model_Pre_Rotation.Missile), 'FaceColor', [0.9 0.15 0.05], 'EdgeColor', 'none', 'FaceLighting', 'gouraud');
+        uistack(Missile_Model, 'top');
+        Plane_Model = patch('Faces', Plane_Faces, 'Vertices', TransformSTL3D(Plane_Vertices, [Plane_Position(1); Plane_Position(2); 0], Plane_Heading + Model_Heading_Offset.Plane, Model_Scale.Plane, Model_Axis_Order.Plane, Model_Pre_Rotation.Plane), 'FaceColor', [0.45 0.45 0.45], 'EdgeColor', 'none', 'FaceLighting', 'gouraud');
+        uistack(Plane_Model, 'top');
+        SAM_Model = patch('Faces', SAM_Faces, 'Vertices', TransformSAMSTL2D(SAM_Vertices, SAM_Position, SAM_Heading + Model_Heading_Offset.SAM, Model_Scale.SAM), 'FaceColor', [0.25 0.35 0.25], 'EdgeColor', 'none', 'FaceLighting', 'gouraud', 'AmbientStrength', 0.45, 'DiffuseStrength', 0.65, 'SpecularStrength', 0.1);
+        uistack(SAM_Model, 'bottom');
+    
+    end
+    
+    Camera_Center = Missile_Position;
+    Follow_Window = 300;
+
+end
+
+while Keep_Running && Step < Max_Steps
+    Step         = Step + 1;
+    Current_Time = Step * Delta_Time;
+
+    % --- PLANE EVASION ---
+    Missile_to_Plane_Vector   = Plane_Position - Missile_Position;
+    Missile_to_Plane_Distance = norm(Missile_to_Plane_Vector) + 1e-9;
+    LOS_Unit                  = Missile_to_Plane_Vector / Missile_to_Plane_Distance;
+
+    Boundary_Force    = [0; 0];
+    Boundary_Force(1) = Boundary_Force(1) + max(0, 1 - Plane_Position(1) / Boundary_Margin);
+    Boundary_Force(1) = Boundary_Force(1) - max(0, 1 - (Arena_Size - Plane_Position(1)) / Boundary_Margin);
+    Boundary_Force(2) = Boundary_Force(2) + max(0, 1 - Plane_Position(2) / Boundary_Margin);
+    Boundary_Force(2) = Boundary_Force(2) - max(0, 1 - (Arena_Size - Plane_Position(2)) / Boundary_Margin);
+
+    Plane_Obstacle_Force = [0; 0];
+    
+    for i = 1:Num_Obstacles
+        Vec_Away = Plane_Position - Obstacle_Center(1:2,i);
+        Dist_Center  = norm(Vec_Away) + 1e-9;
+        Dist_Surface = max(Dist_Center - Obstacle_Radius(i), 0.01);
+        if Dist_Surface < Influence_Radius
+            Unit_Away = Vec_Away / Dist_Center;
+            Rep_Mag   = 300 * (1/Dist_Surface - 1/Influence_Radius) / Dist_Surface^2;
+            Plane_Obstacle_Force = Plane_Obstacle_Force + Rep_Mag * Unit_Away;
+        end
+    end
+
+    Perp_A = [-LOS_Unit(2);  LOS_Unit(1)];
+    Perp_B = [ LOS_Unit(2); -LOS_Unit(1)];
+    Current_Direction = [cos(Plane_Heading); sin(Plane_Heading)];
+
+    if dot(Perp_A, Current_Direction) >= dot(Perp_B, Current_Direction)
+        Base_Beam_Direction = Perp_A;
+    else
+        Base_Beam_Direction = Perp_B;
+    end
+
+    Jink_Bias      = 0.65 + 0.35 * sin(2 * pi * Current_Time / Jink_Period);
+    Beam_Direction = Jink_Bias * Base_Beam_Direction;
+    Beam_Direction = Beam_Direction / (norm(Beam_Direction) + 1e-9);
+
+    Away_Weight = max(0.15, 0.9 * (1 - Missile_to_Plane_Distance / Close_Range));
+
+    Plane_Noise_Angle = 0.96 * Plane_Noise_Angle + 0.04 * randn();
+    Noise_Direction   = [cos(Plane_Noise_Angle); sin(Plane_Noise_Angle)];
+
+    Plane_Evasion_Vector    = 0.6 * Beam_Direction + Away_Weight * LOS_Unit + Plane_Noise_Weight * Noise_Direction + 1.5 * Boundary_Force + 0.6 * Plane_Obstacle_Force;
+    Smoothed_Evasion = 0.75 * Smoothed_Evasion + 0.25 * Plane_Evasion_Vector;
+    Plane_Desired_Direction = Smoothed_Evasion / (norm(Smoothed_Evasion) + 1e-9);
+
+    Plane_Desired_Heading = atan2(Plane_Desired_Direction(2), Plane_Desired_Direction(1));
+    Plane_Heading_Error   = atan2(sin(Plane_Desired_Heading - Plane_Heading), cos(Plane_Desired_Heading - Plane_Heading));
+    Plane_Max_Turn_Step   = Plane_Max_Turn_Rate * Delta_Time;
+    Plane_Heading         = Plane_Heading + sign(Plane_Heading_Error) * min(abs(Plane_Heading_Error), Plane_Max_Turn_Step);
+
+    Plane_Velocity = Plane_Speed * [cos(Plane_Heading); sin(Plane_Heading)];
+    Plane_Position = Plane_Position + Plane_Velocity * Delta_Time;
+
+
+    if Flags.Use_3D_View
+        Plane_Z_Accel = Plane_Z_Max_Accel * (2*rand - 1);
+
+        Plane_Z_Velocity = Plane_Z_Velocity + Plane_Z_Accel * Delta_Time;
+        Plane_Z_Velocity = max(min(Plane_Z_Velocity, 45), -45);
+
+        Plane_Z = Plane_Z + Plane_Z_Velocity * Delta_Time;
+
+        if Plane_Z < 20
+            Plane_Z = 20;
+            Plane_Z_Velocity = abs(Plane_Z_Velocity);
+        elseif Plane_Z > Arena_Z_Max - 20
+            Plane_Z = Arena_Z_Max - 20;
+            Plane_Z_Velocity = -abs(Plane_Z_Velocity);
+        end
+
+        Altitude_Error = Plane_Z - Missile_Z;
+
+        Missile_Z_Accel = 0.15 * Altitude_Error - 0.5 * Missile_Z_Velocity;
+        Missile_Z_Accel = max(min(Missile_Z_Accel, 12), -12);
+
+        Missile_Z_Velocity = Missile_Z_Velocity + Missile_Z_Accel * Delta_Time;
+        Missile_Z_Velocity = max(min(Missile_Z_Velocity, 35), -35);
+
+        Missile_Z = Missile_Z + Missile_Z_Velocity * Delta_Time;
+        Missile_Z = max(0, min(Arena_Z_Max, Missile_Z));
+   
+    else
+        Plane_Z = 0;
+        Missile_Z = 0;
+    end
+
+    % --- LOS CHECK ---
+    LOS_Blocked = false;
+
+    Missile_Position_3D = [Missile_Position(1); Missile_Position(2); Missile_Z];
+    Plane_Position_3D   = [Plane_Position(1);   Plane_Position(2);   Plane_Z];
+
+    Segment_Vec_3D = Plane_Position_3D - Missile_Position_3D;
+
+    for i = 1:Num_Obstacles
+        To_Obstacle_3D = Obstacle_Center(:,i) - Missile_Position_3D;
+        Projection = dot(To_Obstacle_3D, Segment_Vec_3D) / (dot(Segment_Vec_3D, Segment_Vec_3D) + 1e-9);
+        Projection = max(0, min(1, Projection));
+        Closest_Point_3D = Missile_Position_3D + Projection * Segment_Vec_3D;
+        Distance_To_LOS = norm(Obstacle_Center(:,i) - Closest_Point_3D);
+        LOS_Clearance_Buffer = 5;
+
+        if Distance_To_LOS < Obstacle_Radius(i) + LOS_Clearance_Buffer
+            LOS_Blocked = true;
+            break;
+        end
+    end
+    
+    LOS_Z = [0, 0];
+    if Flags.Use_3D_View
+        LOS_Z = [Missile_Z, Plane_Z];
+    end
+    
+
+    % --- GUIDANCE TARGET SELECTION ---
+    if ~LOS_Blocked
+        Guidance_Target_Position = Plane_Position;
+        Guidance_Target_Velocity = Plane_Velocity;
+        Last_Plane_Position      = Plane_Position;
+        Last_Plane_Velocity      = Plane_Velocity;
+        Occlusion_Timer          = 0.0;
+        Using_PN                 = true;
+    else
+        Occlusion_Timer          = Occlusion_Timer + Delta_Time;
+        Prediction_Time          = min(Occlusion_Timer, 4.0);
+        Guidance_Target_Position = Last_Plane_Position + Last_Plane_Velocity * Prediction_Time;
+        Guidance_Target_Velocity = Last_Plane_Velocity;
+        Using_PN                 = false;
+    end
+
+    % --- BOUNDARY REPULSION ---
+    Force_Boundary = [0; 0];
+    d = max(Missile_Position(1), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(1) = Force_Boundary(1) + Missile_Boundary_Gain * (1/d - 1/Missile_Boundary_Margin) / d^2;
+    end
+    d = max(Arena_Size - Missile_Position(1), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(1) = Force_Boundary(1) - Missile_Boundary_Gain * (1/d - 1/Missile_Boundary_Margin) / d^2;
+    end
+    d = max(Missile_Position(2), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(2) = Force_Boundary(2) + Missile_Boundary_Gain * (1/d - 1/Missile_Boundary_Margin) / d^2;
+    end
+    d = max(Arena_Size - Missile_Position(2), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(2) = Force_Boundary(2) - Missile_Boundary_Gain * (1/d - 1/Missile_Boundary_Margin) / d^2;
+    end
+
+    % --- OBSTACLE REPULSION ---
+    Force_Repulsive = [0; 0];
+    Min_Obs_Dist    = inf;
+    for i = 1:Num_Obstacles
+        Vec_Away = Missile_Position - Obstacle_Center(1:2,i);
+        Dist_Center  = norm(Vec_Away) + 1e-9;
+        Dist_Surface = max(Dist_Center - Obstacle_Radius(i), 0.01);
+        Min_Obs_Dist = min(Min_Obs_Dist, Dist_Surface);
+        if Dist_Surface < Influence_Radius
+            Unit_Away  = Vec_Away / Dist_Center;
+            Perp_Left  = [-Unit_Away(2);  Unit_Away(1)];
+            Perp_Right = [ Unit_Away(2); -Unit_Away(1)];
+            To_Target  = Guidance_Target_Position - Missile_Position;
+            if dot(To_Target, Perp_Left) >= dot(To_Target, Perp_Right)
+                Preferred_Dodge = Perp_Left;
+            else
+                Preferred_Dodge = Perp_Right;
+            end
+            Rep_Mag         = Gain_Repulsive * (1/Dist_Surface - 1/Influence_Radius) / Dist_Surface^2;
+            Force_Repulsive = Force_Repulsive + Rep_Mag * (0.5 * Unit_Away + 0.5 * Preferred_Dodge);
+        end
+    end
+
+% --- RELATIVE GEOMETRY ---
+Missile_Velocity  = Missile_Speed * [cos(Missile_Heading); sin(Missile_Heading)];
+Relative_Position = Guidance_Target_Position - Missile_Position;
+Relative_Distance = norm(Relative_Position) + 1e-9;
+LOS_Unit = Relative_Position / Relative_Distance;
+Relative_Velocity = Guidance_Target_Velocity - Missile_Velocity;
+
+% --- GUIDANCE LAW ---
+Navigation_Constant = 2.5;
+Desired_Direction = Relative_Position / Relative_Distance;
+Current_Direction = [cos(Missile_Heading); sin(Missile_Heading)];
+
+if Using_PN
+    % --- PROPORTIONAL NAVIGATION ---
+    LOS_Rate = (Relative_Position(1)*Relative_Velocity(2) - Relative_Position(2)*Relative_Velocity(1)) / (Relative_Distance^2);
+
+    Closing_Velocity = -dot(Relative_Velocity, LOS_Unit);
+    Closing_Velocity = max(Closing_Velocity, 0);
+
+    A_PN_Magnitude = Navigation_Constant * Closing_Velocity * LOS_Rate;
+    A_PN_Direction = [-LOS_Unit(2); LOS_Unit(1)];
+
+    A_PN = A_PN_Magnitude * A_PN_Direction;
+
+    Lead_Gain = 0.8;
+    A_Guidance = A_PN + Lead_Gain * Missile_Speed * (Desired_Direction - Current_Direction);
+else
+   
+    % --- PREDICTIVE GUIDANCE WHEN LOS IS BLOCKED ---
+    Predictive_Gain = 0.8;
+
+    A_Guidance = Predictive_Gain * Missile_Speed * (Desired_Direction - Current_Direction);
+end
+
+% --- APF (OBSTACLE + BOUNDARY AVOIDANCE) ---
+A_APF = Force_Repulsive + Force_Boundary;
+
+% Clamp APF to prevent spikes
+Max_APF = 80;
+if norm(A_APF) > Max_APF
+    A_APF = Max_APF * A_APF / norm(A_APF);
+end
+
+% --- COMBINE GUIDANCE ---
+APF_Weight = max(0, min(1.0, (Influence_Radius - Min_Obs_Dist) / Influence_Radius));
+APF_Weight = 1.0 * APF_Weight;   % was 0.6 — increased so APF actually competes with PN
+A_Command = A_Guidance + APF_Weight * A_APF;
+
+% Clamp total command to G limit BEFORE extracting turn rate
+Max_Total_Accel = Missile_G_Max * 9.81;
+if norm(A_Command) > Max_Total_Accel
+    A_Command = Max_Total_Accel * A_Command / norm(A_Command);
+end
+
+% --- CONVERT ACCELERATION TO TURN RATE ---
+A_Lateral = dot(A_Command, [-sin(Missile_Heading); cos(Missile_Heading)]);
+
+Turn_Rate_Command = A_Lateral / Missile_Speed;
+
+% --- LIMIT TURN RATE (G LIMIT) ---
+Max_Turn_Rate = Missile_G_Max * 9.81 / Missile_Speed;
+
+Turn_Rate = max(min(Turn_Rate_Command, Max_Turn_Rate), -Max_Turn_Rate);
+
+% --- APPLY TURN ---
+Missile_Heading = Missile_Heading + Turn_Rate * Delta_Time;
+
+% --- G LOAD ---
+Missile_G = abs(Turn_Rate) * Missile_Speed / 9.81;
+
+% --- POSITION UPDATE ---
+Missile_Position(1) = Missile_Position(1) + Missile_Speed * cos(Missile_Heading) * Delta_Time;
+Missile_Position(2) = Missile_Position(2) + Missile_Speed * sin(Missile_Heading) * Delta_Time;
+
+Current_Distance = norm([Missile_Position; Missile_Z] - [Plane_Position; Plane_Z]);
+
+if Current_Distance <= Capture_Radius
+    Intercept    = true;
+    Keep_Running = false;
+
+    Overshoot_Dir_3D = [Missile_Position; Missile_Z] - [Plane_Position; Plane_Z];
+    Overshoot_Dir_3D = Overshoot_Dir_3D / (norm(Overshoot_Dir_3D) + 1e-9);
+    Missile_Position = Plane_Position + Capture_Radius * Overshoot_Dir_3D(1:2);
+    Missile_Z        = Plane_Z        + Capture_Radius * Overshoot_Dir_3D(3);
+    fprintf('INTERCEPT at t = %.2f s\n', Current_Time);
+end
+
+if Missile_G >= Missile_G_Max && Step > 1 && ~Intercept
+    fprintf('MISSILE FAILED: exceeded G limit at t = %.2f s\n', Current_Time);
+    Keep_Running = false;
+end
+
+    if any(Missile_Position < 0) || any(Missile_Position > Arena_Size)
+        fprintf('Missile left arena at t = %.2f s\n', Current_Time);
+        Keep_Running = false;
+    end
+
+    % --- LOG ---
+    Log_Missile_X(Step)   = Missile_Position(1);
+    Log_Missile_Y(Step)   = Missile_Position(2);
+    Log_Plane_X(Step)     = Plane_Position(1);
+    Log_Plane_Y(Step)     = Plane_Position(2);
+    Log_Distance(Step)    = Current_Distance;
+    Log_Time(Step)        = Current_Time;
+    Log_LOS_Blocked(Step) = LOS_Blocked;
+    Log_Missile_G(Step)   = Missile_G;
+
+    % --- ANIMATE ---
+if Flags.Use_Live_Animation && mod(Step, Animation_Step) == 0
+        if Flags.Use_3D_View
+            addpoints(Missile_Trail, Missile_Position(1), Missile_Position(2), Missile_Z);
+            addpoints(Plane_Trail,   Plane_Position(1),   Plane_Position(2),   Plane_Z);
+            set(Missile_Marker, 'XData', Missile_Position(1), 'YData', Missile_Position(2), 'ZData', Missile_Z);
+            set(Plane_Marker,   'XData', Plane_Position(1),   'YData', Plane_Position(2),   'ZData', Plane_Z);
+        else
+            addpoints(Missile_Trail, Missile_Position(1), Missile_Position(2));
+            addpoints(Plane_Trail,   Plane_Position(1),   Plane_Position(2));
+            set(Missile_Marker, 'XData', Missile_Position(1), 'YData', Missile_Position(2));
+            set(Plane_Marker,   'XData', Plane_Position(1),   'YData', Plane_Position(2));
+        end
+
+       if Flags.Use_STL_Models
+            Missile_Model_Position = [Missile_Position(1); Missile_Position(2); Missile_Z];
+            Plane_Model_Position   = [Plane_Position(1);   Plane_Position(2);   Plane_Z];
+
+            set(Missile_Model, 'Vertices', TransformSTL3D( Missile_Vertices, Missile_Model_Position, Missile_Heading + Model_Heading_Offset.Missile, Model_Scale.Missile, Model_Axis_Order.Missile, Model_Pre_Rotation.Missile));
+            set(Plane_Model, 'Vertices', TransformSTL3D(Plane_Vertices, Plane_Model_Position, Plane_Heading + Model_Heading_Offset.Plane, Model_Scale.Plane, Model_Axis_Order.Plane, Model_Pre_Rotation.Plane));
+        end
+
+        if Flags.Camera_Follow && Flags.Use_3D_View
+    Camera_Distance = 250;
+    Camera_Height   = 90;
+
+    Forward = [cos(Missile_Heading), sin(Missile_Heading), 0];
+    Side    = [-sin(Missile_Heading), cos(Missile_Heading), 0];
+
+    Missile_Camera_Pos = [Missile_Position(1), Missile_Position(2), Missile_Z];
+
+    Camera_Pos = Missile_Camera_Pos - Camera_Distance * Forward + 0.35 * Camera_Distance * Side + [0, 0, Camera_Height];
+
+    campos(Camera_Pos);
+    camtarget(Missile_Camera_Pos + 120 * Forward + [0, 0, 25]);
+    camup([0 0 1]);
+
+    camproj perspective
+    camva(32)
+
+    xlim([Missile_Position(1)-450, Missile_Position(1)+450]);
+    ylim([Missile_Position(2)-450, Missile_Position(2)+450]);
+    zlim([max(0, Missile_Z-150), min(Arena_Z_Max, Missile_Z+250)]);
+        elseif Flags.Camera_Follow
+            Camera_Center = 0.9 * Camera_Center + 0.1 * Missile_Position;
+
+            xlim([Camera_Center(1) - Follow_Window, Camera_Center(1) + Follow_Window]);
+            ylim([Camera_Center(2) - Follow_Window, Camera_Center(2) + Follow_Window]);
+
+        else
+            xlim([0 Arena_Size]);
+            ylim([0 Arena_Size]);
+
+            if Flags.Use_3D_View
+                zlim([0 Arena_Z_Max]);
+                camproj perspective
+            end
+        end
+       
+        if LOS_Blocked
+            set(LOS_Line, 'XData', [Missile_Position(1), Plane_Position(1)], 'YData', [Missile_Position(2), Plane_Position(2)], 'ZData', LOS_Z, 'Color', 'r', 'LineStyle', '--');
+        else
+            set(LOS_Line, 'XData', [Missile_Position(1), Plane_Position(1)], 'YData', [Missile_Position(2), Plane_Position(2)], 'ZData', LOS_Z, 'Color', 'g', 'LineStyle', '-');
+        end
+
+        drawnow limitrate;
+        pause(Delta_Time / Replay_Speed);
+end 
+
+end  
+
+% END OF MAIN LOOP
+
+if Flags.Use_Live_Animation
+    figure(Sim_Fig);
+    rotate3d(Sim_Fig, 'on');
+    zoom(Sim_Fig, 'off');
+    pan(Sim_Fig, 'off');
+end
+
+%% ========================================================================
+% SECTION 5: TRIM LOGS
+% =========================================================================
+
+Log_Time        = Log_Time(1:Step);
+Log_Distance    = Log_Distance(1:Step);
+Log_LOS_Blocked = Log_LOS_Blocked(1:Step);
+Log_Missile_X   = Log_Missile_X(1:Step);
+Log_Missile_Y   = Log_Missile_Y(1:Step);
+Log_Plane_X     = Log_Plane_X(1:Step);
+Log_Plane_Y     = Log_Plane_Y(1:Step);
+Log_LOS_Angle       = nan(1, Step);
+Log_Plane_Heading   = nan(1, Step);
+Log_Missile_Heading = nan(1, Step);
+Log_Beam_Angle      = nan(1, Step);
+Log_Plane_Speed_Mag = nan(1, Step);
+Log_Closing_Rate    = nan(1, Step);
+Log_LOS_Rate        = nan(1, Step);
+Log_Accel_Demand    = nan(1, Step);
+Log_Missile_G   = Log_Missile_G(1:Step);
+
+%% ========================================================================
+% SECTION 6: COMPUTE DERIVED QUANTITIES
+% =========================================================================
+
+for k = 2:Step
+    los      = [Log_Plane_X(k)   - Log_Missile_X(k);   Log_Plane_Y(k)   - Log_Missile_Y(k)];
+    los_prev = [Log_Plane_X(k-1) - Log_Missile_X(k-1); Log_Plane_Y(k-1) - Log_Missile_Y(k-1)];
+
+    los_angle      = atan2(los(2),      los(1));
+    los_angle_prev = atan2(los_prev(2), los_prev(1));
+    Log_LOS_Angle(k) = rad2deg(los_angle);
+
+    los_rate        = atan2(sin(los_angle - los_angle_prev), cos(los_angle - los_angle_prev)) / Delta_Time;
+    Log_LOS_Rate(k) = rad2deg(los_rate);
+
+    dp = [Log_Plane_X(k)   - Log_Plane_X(k-1);   Log_Plane_Y(k)   - Log_Plane_Y(k-1)];
+    dm = [Log_Missile_X(k) - Log_Missile_X(k-1); Log_Missile_Y(k) - Log_Missile_Y(k-1)];
+
+    plane_spd              = norm(dp);
+    Log_Plane_Speed_Mag(k) = plane_spd / Delta_Time;
+
+    if plane_spd > 0.01
+        ph                   = atan2(dp(2), dp(1));
+        Log_Plane_Heading(k) = rad2deg(ph);
+        beam                 = atan2(sin(ph - los_angle), cos(ph - los_angle));
+        Log_Beam_Angle(k)    = abs(rad2deg(beam));
+    end
+
+    if norm(dm) > 0.01
+        mh                     = atan2(dm(2), dm(1));
+        Log_Missile_Heading(k) = rad2deg(mh);
+        prev_mh                = deg2rad(Log_Missile_Heading(max(k-1, 2)));
+        turn_rate              = atan2(sin(mh - prev_mh), cos(mh - prev_mh)) / Delta_Time;
+        Log_Accel_Demand(k)    = abs(turn_rate) * Missile_Speed;
+    end
+
+    los_unit            = los / (norm(los) + 1e-9);
+    rel_vel             = dp/Delta_Time - dm/Delta_Time;
+    Log_Closing_Rate(k) = -dot(rel_vel, los_unit);
+end
+
+if ~Flags.Use_Live_Animation
+    figure('Name', 'Simulation Trajectory', 'Color', 'k');
+    hold on; grid on;
+    set(gca, 'Color', [0.05 0.05 0.05]);
+    set(gca, 'GridColor', [0.3 0.3 0.3]);
+    axis equal;
+    xlabel('X (m)'); ylabel('Y (m)');
+    title(sprintf('Trajectory  |  Intercept: %s  |  t = %.1fs', string(Intercept), Current_Time), 'Color', 'w');
+
+    for i = 1:Num_Obstacles
+        th = linspace(0, 2*pi, 60);
+        fill(Obstacle_Center(1,i) + Obstacle_Radius(i)*cos(th), Obstacle_Center(2,i) + Obstacle_Radius(i)*sin(th), [0.75 0.75 0.75], 'EdgeColor', [0.5 0.5 0.5], 'HandleVisibility', 'off');
+    end
+
+    plot(Log_Missile_X, Log_Missile_Y, 'c-',  'LineWidth', 2.5, 'DisplayName', 'Missile');
+    plot(Log_Plane_X,   Log_Plane_Y,   'y-',  'LineWidth', 2.0, 'DisplayName', 'Plane');
+    plot(Log_Missile_X(1),   Log_Missile_Y(1),   'ws', 'MarkerSize', 8, 'MarkerFaceColor', 'w', 'DisplayName', 'Missile Start');
+    plot(Log_Plane_X(1),     Log_Plane_Y(1),     'gs', 'MarkerSize', 8, 'MarkerFaceColor', 'g', 'DisplayName', 'Plane Start');
+    plot(Log_Missile_X(end), Log_Missile_Y(end), 'co', 'MarkerSize', 10, 'MarkerFaceColor', 'c', 'HandleVisibility', 'off');
+    plot(Log_Plane_X(end),   Log_Plane_Y(end),   'y^', 'MarkerSize', 10, 'MarkerFaceColor', 'y', 'HandleVisibility', 'off');
+    legend('TextColor', 'w', 'Color', [0.1 0.1 0.1], 'Location', 'best');
+    xlim([0 Arena_Size]); ylim([0 Arena_Size]);
+end
+
+%% ========================================================================
+% SECTION 7: DASHBOARD
+% =========================================================================
+
+if Flags.Use_Dashboard
+
+     figure('Name', 'Simulation Dashboard', 'Color', 'w', 'Position', [50 30 1600 860]);
+    Dashboard_Layout = tiledlayout(3, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
+    title(Dashboard_Layout, sprintf('Dashboard  |  Intercept: %s  |  Duration: %.1fs  |  Obstacles: %d', string(Intercept), Current_Time, Num_Obstacles), 'FontSize', 13, 'FontWeight', 'bold');
+
+      % --- Tile 1: Trajectory (2x2 span) ---
+    ax_traj = nexttile(1, [1 1]);
+    cla(ax_traj);
+    set(ax_traj, 'Color', [0.05 0.05 0.05], 'GridColor', [0.35 0.35 0.35], 'XColor',    [0.85 0.85 0.85], 'YColor',    [0.85 0.85 0.85]);
+    hold(ax_traj, 'on');
+    grid(ax_traj, 'on');
+    box(ax_traj, 'on');
+    daspect(ax_traj, [1 1 1]);
+
+    for i = 1:Num_Obstacles
+        th_d = linspace(0, 2*pi, 60);
+        fill(ax_traj, Obstacle_Center(1,i) + Obstacle_Radius(i)*cos(th_d), Obstacle_Center(2,i) + Obstacle_Radius(i)*sin(th_d), [0.45 0.45 0.45], 'EdgeColor', [0.6 0.6 0.6], 'FaceAlpha', 0.9, 'HandleVisibility', 'off');
+    end
+
+    plot(ax_traj, Missile_Start(1), Missile_Start(2), 'ws', 'MarkerSize', 7, 'MarkerFaceColor', 'w', 'DisplayName', 'Missile Start');
+    plot(ax_traj, Plane_Start(1), Plane_Start(2), 'gs', 'MarkerSize', 7, 'MarkerFaceColor', 'g', 'DisplayName', 'Plane Start');
+    plot(ax_traj, Log_Missile_X, Log_Missile_Y, '-', 'Color', [0.0 0.75 0.95], 'LineWidth', 2.5, 'DisplayName', 'Missile');
+    plot(ax_traj, Log_Plane_X, Log_Plane_Y, '-', 'Color', [1.0 0.85 0.0], 'LineWidth', 2.0, 'DisplayName', 'Plane');
+    plot(ax_traj, Log_Missile_X(end), Log_Missile_Y(end), 'o', 'Color', [0.0 0.75 0.95], 'MarkerFaceColor', [0.0 0.75 0.95], 'MarkerSize', 10, 'HandleVisibility', 'off');
+    plot(ax_traj, Log_Plane_X(end), Log_Plane_Y(end), '^', 'Color', [1.0 0.85 0.0], 'MarkerFaceColor', [1.0 0.85 0.0], 'MarkerSize', 10, 'HandleVisibility', 'off');
+
+    if Intercept
+        T_Color = [0.15 0.95 0.35];
+        T_Str   = sprintf('INTERCEPT  t=%.1fs', Current_Time);
+    else
+        T_Color = [0.95 0.3 0.2];
+        T_Str   = sprintf('NO INTERCEPT  t=%.1fs', Current_Time);
+    end
+    title(ax_traj,  sprintf('Trajectory  |  %s', T_Str), 'Color', T_Color, 'FontSize', 11, 'FontWeight', 'bold');
+    xlabel(ax_traj, 'X (m)', 'Color', [0.85 0.85 0.85]);
+    ylabel(ax_traj, 'Y (m)', 'Color', [0.85 0.85 0.85]);
+    xlim(ax_traj, [0 Arena_Size]);
+    ylim(ax_traj, [0 Arena_Size]);
+    legend(ax_traj, 'TextColor', 'w', 'Color', [0.1 0.1 0.1], 'Location', 'best', 'FontSize', 8);
+
+    % --- Tile 3: Distance ---
+nexttile(3); hold on;
+ymax3 = max(Log_Distance, [], 'omitnan') * 1.15 + 10;
+if isnan(ymax3) || ymax3 <= 0, ymax3 = 100; end
+shadeLOS(Log_Time, Log_LOS_Blocked, Step, [0 ymax3]);
+plot(Log_Time, Log_Distance, 'b-', 'LineWidth', 2, 'DisplayName', 'Range');
+yline(Capture_Radius, 'r--', 'LineWidth', 1.5, 'DisplayName', 'Capture radius');
+ylim([0 ymax3]); grid on;
+xlabel('Time (s)'); ylabel('Distance (m)');
+title('Missile-Plane Range', 'FontSize', 11);
+legend('FontSize', 8, 'Location', 'northeast');
+   
+    % --- Tile 4: Closing Rate ---
+nexttile(4); hold on;
+ylo4 = min(Log_Closing_Rate, [], 'omitnan') - 2;
+yhi4 = max(Log_Closing_Rate, [], 'omitnan') + 2;
+if isnan(ylo4)||isnan(yhi4)||ylo4>=yhi4, ylo4=-5; yhi4=5; end
+shadeLOS(Log_Time, Log_LOS_Blocked, Step, [ylo4 yhi4]);
+plot(Log_Time, Log_Closing_Rate, 'g-', 'LineWidth', 1.8, 'DisplayName', 'Closing rate');
+yline(0, 'k--', 'LineWidth', 1);
+ylim([ylo4 yhi4]); grid on;
+xlabel('Time (s)'); ylabel('m/s');
+title('Closing Rate  [+ve = closing]', 'FontSize', 11);
+legend('FontSize', 8);
+
+% --- Tile 5: Accel Demand ---
+nexttile(4); hold on;
+yhi5 = max(Log_Accel_Demand, [], 'omitnan') * 1.15 + 1;
+if isnan(yhi5)||yhi5<=0, yhi5=50; end
+shadeLOS(Log_Time, Log_LOS_Blocked, Step, [0 yhi5]);
+plot(Log_Time, Log_Accel_Demand, 'Color', [1 0.55 0], 'LineWidth', 1.8, 'DisplayName', 'Accel demand');
+ylim([0 yhi5]); grid on;
+xlabel('Time (s)'); ylabel('m/s²');
+title('Missile Accel Demand', 'FontSize', 11);
+legend('FontSize', 8);
+    
+    % --- Tile 6: Beam angle ---
+nexttile(6);
+hold on;
+shadeLOS(Log_Time, Log_LOS_Blocked, Step, [0 180]);
+plot(Log_Time, Log_Beam_Angle, 'r-', 'LineWidth', 2, 'DisplayName', 'Beam angle');
+yline(90, 'g--', 'LineWidth', 1.5, 'DisplayName', 'Ideal (90°)');
+yline(45, 'k:',  'LineWidth', 1.0, 'DisplayName', 'Min effective (45°)');
+ylim([0 180]); grid on;
+xlabel('Time (s)'); ylabel('Degrees');
+title('Beam Angle  [90° = perfect notch]', 'FontSize', 11);
+legend('FontSize', 8, 'Location', 'northeast');
+
+% --- Tile 7: Headings ---
+nexttile(7);
+hold on;
+shadeLOS(Log_Time, Log_LOS_Blocked, Step, [-180 180]);
+plot(Log_Time, Log_LOS_Angle,       'b-',  'LineWidth', 1.5, 'DisplayName', 'LOS angle');
+plot(Log_Time, Log_Plane_Heading,   'y-',  'LineWidth', 1.5, 'DisplayName', 'Plane heading');
+plot(Log_Time, Log_Missile_Heading, 'c--', 'LineWidth', 1.2, 'DisplayName', 'Missile heading');
+ylim([-180 180]); grid on;
+xlabel('Time (s)'); ylabel('Angle (°)');
+title('Headings & LOS Angle', 'FontSize', 11);
+legend('FontSize', 8, 'Location', 'best');
+
+% --- Tile 8: LOS rate ---
+nexttile(8);
+hold on;
+ylo = min(Log_LOS_Rate, [], 'omitnan') - 5;
+yhi = max(Log_LOS_Rate, [], 'omitnan') + 5;
+if isnan(ylo) || isnan(yhi) || ylo >= yhi
+    ylo = -10; yhi = 10;
+end
+shadeLOS(Log_Time, Log_LOS_Blocked, Step, [ylo yhi]);
+plot(Log_Time, Log_LOS_Rate, 'm-', 'LineWidth', 1.8, 'DisplayName', 'LOS rate');
+yline(0, 'k--', 'LineWidth', 1);
+ylim([ylo yhi]); grid on;
+xlabel('Time (s)'); ylabel('°/s');
+title('LOS Rate  [non-zero = harder intercept]', 'FontSize', 11);
+legend('FontSize', 8);
+
+% --- Tile 9: Missile G Load ---
+nexttile(10);
+hold on;
+yhi9 = max(Log_Missile_G, [], 'omitnan') * 1.1 + 1;
+if isnan(yhi9) || yhi9 <= 0
+    yhi9 = Missile_G_Max * 1.1;
+end
+shadeLOS(Log_Time, Log_LOS_Blocked, Step, [0 yhi9]);
+plot(Log_Time, Log_Missile_G, 'r-', 'LineWidth', 1.8, 'DisplayName', 'Missile G');
+yline(Missile_G_Max, 'k--', 'LineWidth', 1.5, 'DisplayName', 'G limit');
+ylim([0 yhi9]); grid on;
+xlabel('Time (s)'); ylabel('G');
+title('Missile G Load', 'FontSize', 11);
+legend('FontSize', 8);
+
+    % --- Data Cursor ---
+    if Flags.Use_Data_Cursor
+        dcm = datacursormode(gcf);
+        set(dcm, 'Enable', 'on');
+        dcm.UpdateFcn = @(~, event_obj) SimulationDataTip(event_obj, Log_Time, Log_Missile_X, Log_Missile_Y, Log_Plane_X, Log_Plane_Y, Log_Distance, Log_LOS_Blocked);
+    end
+
+end
+
+%% ========================================================================
+% SECTION 8: SUMMARY
+% =========================================================================
+
+fprintf('\n===== SIMULATION SUMMARY =====\n');
+fprintf('Duration:         %.2f s\n',  Current_Time);
+fprintf('Intercept:        %s\n',      string(Intercept));
+fprintf('Final distance:   %.2f m\n',  Log_Distance(end));
+fprintf('Mean beam angle:  %.1f deg\n',   mean(Log_Beam_Angle,  'omitnan'));
+fprintf('Mean LOS rate:    %.2f deg/s\n', mean(abs(Log_LOS_Rate), 'omitnan'));
+fprintf('LOS blocked:      %d of %d steps (%.0f%%)\n', sum(Log_LOS_Blocked), Step, 100*mean(Log_LOS_Blocked));
+fprintf('==============================\n');
+
+function txt = SimulationDataTip(event_obj, Log_Time, Log_Missile_X, Log_Missile_Y, Log_Plane_X, Log_Plane_Y, Log_Distance, Log_LOS_Blocked)
+
+pos = event_obj.Position;
+
+% Find closest logged point by spatial distance to click
+Dist_To_Missile = hypot(Log_Missile_X - pos(1), Log_Missile_Y - pos(2));
+Dist_To_Plane   = hypot(Log_Plane_X   - pos(1), Log_Plane_Y   - pos(2));
+
+[d_m, idx_m] = min(Dist_To_Missile);
+[d_p, idx_p] = min(Dist_To_Plane);
+
+% Use whichever trajectory the click is closest to
+if d_m <= d_p
+    idx = idx_m;
+    agent = 'Missile';
+else
+    idx = idx_p;
+    agent = 'Plane';
+end
+
+txt = {
+    ['Nearest: ', agent]
+    ['Time: ',     num2str(Log_Time(idx),     '%.2f'), ' s']
+    ['Missile: (', num2str(Log_Missile_X(idx),'%.2f'), ', ', num2str(Log_Missile_Y(idx),'%.2f'), ')']
+    ['Plane:   (', num2str(Log_Plane_X(idx),  '%.2f'), ', ', num2str(Log_Plane_Y(idx),  '%.2f'), ')']
+    ['Distance: ', num2str(Log_Distance(idx), '%.2f'), ' m']
+    ['LOS Blocked: ', char(string(Log_LOS_Blocked(idx)))]
+    };
+end
+
+function shadeLOS(Log_Time, Log_LOS_Blocked, Step, yLims)
+LOS_Diff    = diff([0 Log_LOS_Blocked 0]);
+Shade_Start = find(LOS_Diff ==  1);
+Shade_End   = find(LOS_Diff == -1) - 1;
+
+for b = 1:length(Shade_Start)
+    T1 = Log_Time(Shade_Start(b));
+    T2 = Log_Time(min(Shade_End(b), Step));
+
+    patch([T1 T2 T2 T1], [yLims(1) yLims(1) yLims(2) yLims(2)], [1 0.85 0.6], 'EdgeColor', 'none', 'FaceAlpha', 0.35);
+end
+end
+
+
+
+function Settings = SimulationSetupGUI(Plane_Speed, Missile_Speed, Max_Time, Num_Obstacles, Missile_G_Max, Capture_Radius)
+
+Settings.Plane_Speed    = Plane_Speed;
+Settings.Missile_Speed  = Missile_Speed;
+Settings.Max_Time       = Max_Time;
+Settings.Num_Obstacles  = Num_Obstacles;
+Settings.Missile_G_Max  = Missile_G_Max;
+Settings.Capture_Radius = Capture_Radius;
+
+Fig = uifigure('Name', 'Simulation Setup', 'Position', [500 250 430 330], 'CloseRequestFcn', @(src,event) cancelSetup());
+
+Grid = uigridlayout(Fig, [7 3]);
+Grid.RowHeight = repmat({40}, 1, 7);
+Grid.ColumnWidth = {140, '1x', 70};
+Grid.Padding = [15 15 15 15];
+
+AddSlider(Grid, 'Plane Speed',    'Plane_Speed',    5,  50, Plane_Speed);
+AddSlider(Grid, 'Missile Speed',  'Missile_Speed',  5, 100, Missile_Speed);
+AddSlider(Grid, 'Max Time',       'Max_Time',       5, 180, Max_Time);
+AddSlider(Grid, 'Obstacles',      'Num_Obstacles',  0, 100, Num_Obstacles);
+AddSlider(Grid, 'Missile G Max',  'Missile_G_Max',  1,  60, Missile_G_Max);
+AddSlider(Grid, 'Capture Radius', 'Capture_Radius', 1,  20, Capture_Radius);
+
+Run_Button = uibutton(Grid, 'Text', 'Run Simulation', 'ButtonPushedFcn', @(src,event) runSetup());
+
+Run_Button.Layout.Row = 7;
+Run_Button.Layout.Column = [1 3];
+
+Fig.UserData = 'waiting';
+waitfor(Fig, 'UserData', 'done');
+
+if isvalid(Fig)
+    delete(Fig);
+end
+
+    function AddSlider(Grid, Label_Text, Field_Name, Min_Value, Max_Value, Start_Value)
+
+        uilabel(Grid, 'Text', Label_Text);
+
+        Slider = uislider(Grid, 'Limits', [Min_Value Max_Value], 'Value', Start_Value);
+
+        Value_Label = uilabel(Grid, 'Text', num2str(Start_Value, '%.2f'));
+
+        Slider.ValueChangingFcn = @(src,event) UpdateValue(Field_Name, event.Value, Value_Label);
+        Slider.ValueChangedFcn  = @(src,event) UpdateValue(Field_Name, src.Value, Value_Label);
+    end
+
+    function UpdateValue(Field_Name, New_Value, Value_Label)
+
+        if strcmp(Field_Name, 'Num_Obstacles')
+            New_Value = round(New_Value);
+            Value_Label.Text = num2str(New_Value);
+        else
+            Value_Label.Text = num2str(New_Value, '%.2f');
+        end
+
+        Settings.(Field_Name) = New_Value;
+    end
+
+    function runSetup()
+        Fig.UserData = 'done';
+    end
+
+    function cancelSetup()
+        Fig.UserData = 'done';
+    end
+
+end
+
+function Vout = TransformSTL3D(V, Position3D, Heading, Scale, Axis_Order, Pre_Rotation)
+
+V = V(:, Axis_Order);
+V = V * Scale;
+
+Rx = [1, 0, 0;
+      0, cos(Pre_Rotation(1)), -sin(Pre_Rotation(1));
+      0, sin(Pre_Rotation(1)),  cos(Pre_Rotation(1))];
+
+Ry = [ cos(Pre_Rotation(2)), 0, sin(Pre_Rotation(2));
+       0,                    1, 0;
+      -sin(Pre_Rotation(2)), 0, cos(Pre_Rotation(2))];
+
+Rz_pre = [cos(Pre_Rotation(3)), -sin(Pre_Rotation(3)), 0;
+          sin(Pre_Rotation(3)),  cos(Pre_Rotation(3)), 0;
+          0,                     0,                    1];
+
+Rz_heading = [cos(Heading), -sin(Heading), 0;
+              sin(Heading),  cos(Heading), 0;
+              0,             0,            1];
+
+V = V * Rx';
+V = V * Ry';
+V = V * Rz_pre';
+V = V * Rz_heading';
+
+Vout = V + Position3D';
+
+end
+
+%% ========================================================================
+% SECTION 9: BATCH TUNING
+% =========================================================================
+
+if Flags.Run_Batch_Tuning
+    Nav_Values = [2.0, 2.5, 3.0, 3.5];
+    APF_Values = [0.3, 0.6, 0.9, 1.2];
+
+    Num_Nav = length(Nav_Values);
+    Num_APF = length(APF_Values);
+    Runs_Per_Combo = 10;
+
+    Success_Grid    = zeros(Num_Nav, Num_APF);
+    MeanG_Grid      = zeros(Num_Nav, Num_APF);
+    MeanDist_Grid   = zeros(Num_Nav, Num_APF);
+    MeanDur_Grid    = zeros(Num_Nav, Num_APF);
+    Collision_Grid  = zeros(Num_Nav, Num_APF);
+    Trajectory_Results = cell(Num_Nav, Num_APF, Runs_Per_Combo);
+
+    rng('shuffle');
+    Run_Seeds = randi(1e6, Num_Nav, Num_APF, Runs_Per_Combo);
+    fprintf('Seeds: '); fprintf('%d ', Run_Seeds); fprintf('\n');    
+    for ni = 1:Num_Nav
+        for ai = 1:Num_APF
+            Successes  = 0;
+            Collisions = 0;
+            G_Vals     = zeros(1, Runs_Per_Combo);
+            Dist_Vals  = zeros(1, Runs_Per_Combo);
+            Dur_Vals   = zeros(1, Runs_Per_Combo);
+
+            for r = 1:Runs_Per_Combo
+                R = Run_Single_Sim(Nav_Values(ni), APF_Values(ai), Plane_Speed, Missile_Speed, Max_Time, Num_Obstacles, Missile_G_Max, Capture_Radius, Run_Seeds(ni, ai, r), Params);
+                Successes    = Successes  + R.Intercept;
+                Collisions   = Collisions + R.Hit_Obstacle;
+                G_Vals(r)    = R.Max_G;
+                Dist_Vals(r) = R.Final_Distance;
+                Dur_Vals(r)  = R.Duration;
+                Trajectory_Results{ni, ai, r} = R;
+            end
+
+            Success_Grid(ni, ai)   = Successes  / Runs_Per_Combo * 100;
+            Collision_Grid(ni, ai) = Collisions / Runs_Per_Combo * 100;
+            MeanG_Grid(ni, ai)     = mean(G_Vals);
+            MeanDist_Grid(ni, ai)  = mean(Dist_Vals);
+            MeanDur_Grid(ni, ai)   = mean(Dur_Vals);
+
+            fprintf('N=%.1f  APF=%.1f  ->  Success: %.0f%%  Collision: %.0f%%  MeanG: %.1f  MeanDist: %.1f  MeanDur: %.1fs\n', Nav_Values(ni), APF_Values(ai), Success_Grid(ni,ai), Collision_Grid(ni,ai), MeanG_Grid(ni,ai), MeanDist_Grid(ni,ai), MeanDur_Grid(ni,ai));
+        end
+    end
+
+% -------------------------------------------------------------------------
+% PLOT: 2x3 heatmap grid
+% -------------------------------------------------------------------------
+figure('Name', 'Tuning Heatmap', 'Color', 'w', 'Position', [50 50 1400 800]);
+Batch_Layout = tiledlayout(2, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+title(Batch_Layout, sprintf('HeatMAP Tuning  |  %d runs per combo  |  %d obstacles', Runs_Per_Combo, Num_Obstacles), 'FontSize', 13, 'FontWeight', 'bold');
+
+Metrics = {Success_Grid,   'Success Rate (%)',       'success';
+           Collision_Grid, 'Obstacle Collision (%)', 'collision';
+           MeanG_Grid,     'Mean Max G',             'g_load';
+           MeanDist_Grid,  'Mean Final Distance (m)','distance';
+           MeanDur_Grid,   'Mean Duration (s)',       'duration'};
+
+Cmaps = {'parula', 'hot', 'turbo', 'cool', 'gray'};
+
+% For collision and G, lower is better — flip colormap
+Flip = [false, true, true, false, false];
+
+for m = 1:5
+    nexttile;
+    Data = Metrics{m,1};
+    Cmap = colormap(Cmaps{m});
+    if Flip(m)
+        Cmap = flipud(Cmap);
+    end
+
+    imagesc(APF_Values, Nav_Values, Data);
+    colormap(gca, Cmap);
+    colorbar;
+    set(gca, 'YDir', 'normal');
+    xticks(APF_Values); yticks(Nav_Values);
+    xlabel('APF Weight'); ylabel('Nav Constant');
+    title(Metrics{m,2}, 'FontSize', 11);
+
+    % Annotate each cell with value + G on success panel
+    for ni = 1:Num_Nav
+        for ai = 1:Num_APF
+            if m == 1
+                % Success panel: show success% and mean G together
+                label = sprintf('%.0f%%\nG:%.1f', Success_Grid(ni,ai), MeanG_Grid(ni,ai));
+            else
+                label = sprintf('%.1f', Data(ni,ai));
+            end
+            text(APF_Values(ai), Nav_Values(ni), label, 'HorizontalAlignment', 'center', 'VerticalAlignment',   'middle', 'FontSize', 8, 'FontWeight', 'bold', 'Color', 'w');
+        end
+    end
+end
+
+
+% --- Tile 6: Best combo summary bar chart ---
+nexttile(Batch_Layout);
+[Best_Val, Best_Idx] = max(Success_Grid(:));
+[Best_ni, Best_ai]   = ind2sub(size(Success_Grid), Best_Idx);
+
+Categories = {'Success %', 'Collision %', 'Mean G', 'Mean Dist/10', 'Mean Dur'};
+Values     = [Success_Grid(Best_ni, Best_ai), Collision_Grid(Best_ni, Best_ai), MeanG_Grid(Best_ni, Best_ai), MeanDist_Grid(Best_ni, Best_ai)/10, MeanDur_Grid(Best_ni, Best_ai)];
+bar(Values, 'FaceColor', [0.2 0.6 0.9]);
+set(gca, 'XTickLabel', Categories, 'XTick', 1:5);
+title(sprintf('Best Combo: N=%.1f  APF=%.1f  (%.0f%% success)', Nav_Values(Best_ni), APF_Values(Best_ai), Best_Val), 'FontSize', 11);
+ylabel('Value'); grid on;
+
+% -------------------------------------------------------------------------
+% FIGURE 3: BEST RUN TRAJECTORIES
+% -------------------------------------------------------------------------
+figure('Name', 'Batch Trajectories - Best Runs', 'Color', 'w', 'Position', [60 60 1400 820]);
+Best_Layout = tiledlayout(Num_Nav, Num_APF, 'TileSpacing', 'compact', 'Padding', 'compact');
+title(Best_Layout, 'Best Run Per Combo  [green = intercept | red = closest miss]', 'FontSize', 12, 'FontWeight', 'bold');
+
+for ni = 1:Num_Nav
+    for ai = 1:Num_APF
+
+        % --- Find best run: shortest intercept, else closest miss ---
+        Best_Run      = 1;
+        Best_Dur      = inf;
+        Best_Dist     = inf;
+        Found_Success = false;
+
+        for r_scan = 1:Runs_Per_Combo
+            Tr_scan = Trajectory_Results{ni, ai, r_scan};
+            if Tr_scan.Intercept
+                if ~Found_Success || Tr_scan.Duration < Best_Dur
+                    Best_Dur      = Tr_scan.Duration;
+                    Best_Run      = r_scan;
+                    Found_Success = true;
+                end
+            elseif ~Found_Success && Tr_scan.Final_Distance < Best_Dist
+                Best_Dist = Tr_scan.Final_Distance;
+                Best_Run  = r_scan;
+            end
+        end
+
+        Tr = Trajectory_Results{ni, ai, Best_Run};
+
+        Tile_Axis = nexttile(Best_Layout);
+        hold(Tile_Axis, 'on');
+        axis(Tile_Axis, 'equal');
+        grid(Tile_Axis, 'on');
+        set(Tile_Axis, 'Color', [0.05 0.05 0.05], 'GridColor', [0.25 0.25 0.25]);
+
+        % Draw obstacles
+        for obs_i = 1:length(Tr.Obs_Radius)
+            th_obs = linspace(0, 2*pi, 40);
+            fill(Tile_Axis, Tr.Obs_Center(1,obs_i) + Tr.Obs_Radius(obs_i)*cos(th_obs), Tr.Obs_Center(2,obs_i) + Tr.Obs_Radius(obs_i)*sin(th_obs), [0.55 0.55 0.55], 'EdgeColor', [0.4 0.4 0.4], 'FaceAlpha', 0.8);
+        end
+
+        if Tr.Intercept
+            Plane_Color = [0.0 0.85 0.2];
+        else
+            Plane_Color = [0.9 0.2 0.1];
+        end
+
+        plot(Tile_Axis, Tr.Missile_X, Tr.Missile_Y, '-', 'Color', [0.0 0.7 0.9], 'LineWidth', 1.5);
+        plot(Tile_Axis, Tr.Plane_X,   Tr.Plane_Y,   '-', 'Color', Plane_Color,   'LineWidth', 1.5);
+
+        % Start markers
+        plot(Tile_Axis, Tr.Missile_X(1), Tr.Missile_Y(1), 'o', 'Color', [0.0 0.7 0.9], 'MarkerFaceColor', [0.0 0.7 0.9], 'MarkerSize', 4);
+        plot(Tile_Axis, Tr.Plane_X(1),   Tr.Plane_Y(1),   's', 'Color', Plane_Color,   'MarkerFaceColor', Plane_Color,   'MarkerSize', 4);
+
+        All_X = [Tr.Missile_X, Tr.Plane_X];
+        All_Y = [Tr.Missile_Y, Tr.Plane_Y];
+        if ~isempty(All_X)
+            X_Pad = max((max(All_X)-min(All_X))*0.06, 15);
+            Y_Pad = max((max(All_Y)-min(All_Y))*0.06, 15);
+            xlim(Tile_Axis, [min(All_X)-X_Pad, max(All_X)+X_Pad]);
+            ylim(Tile_Axis, [min(All_Y)-Y_Pad, max(All_Y)+Y_Pad]);
+        end
+
+        if Tr.Intercept
+            Status_Str = sprintf('%.1fs', Tr.Duration);
+        else
+            Status_Str = sprintf('miss %.0fm', Tr.Final_Distance);
+        end
+        title(Tile_Axis, sprintf('N=%.1f APF=%.1f | %.0f%% | %s', Nav_Values(ni), APF_Values(ai), Success_Grid(ni,ai), Status_Str), 'FontSize', 7, 'Color', 'k');
+        set(Tile_Axis, 'XTickLabel', [], 'YTickLabel', []);
+    end
+end
+
+% -------------------------------------------------------------------------
+% FIGURE 4: WORST RUN TRAJECTORIES
+% -------------------------------------------------------------------------
+figure('Name', 'Batch Trajectories - Worst Runs', 'Color', 'w', 'Position', [100 40 1400 820]);
+Worst_Layout = tiledlayout(Num_Nav, Num_APF, 'TileSpacing', 'compact', 'Padding', 'compact');
+title(Worst_Layout, 'Worst Run Per Combo  [orange = collision | red = longest failure]', 'FontSize', 12, 'FontWeight', 'bold');
+
+for ni = 1:Num_Nav
+    for ai = 1:Num_APF
+
+        % --- Find worst run: collision first, then longest duration failure ---
+        Worst_Run     = 1;
+        Worst_Dur     = -inf;
+        Found_Collide = false;
+
+        for r_scan = 1:Runs_Per_Combo
+            Tr_scan = Trajectory_Results{ni, ai, r_scan};
+            if Tr_scan.Hit_Obstacle
+                if ~Found_Collide || Tr_scan.Duration > Worst_Dur
+                    Worst_Dur     = Tr_scan.Duration;
+                    Worst_Run     = r_scan;
+                    Found_Collide = true;
+                end
+            elseif ~Found_Collide && ~Tr_scan.Intercept
+                if Tr_scan.Duration > Worst_Dur
+                    Worst_Dur = Tr_scan.Duration;
+                    Worst_Run = r_scan;
+                end
+            elseif ~Found_Collide && Tr_scan.Intercept
+                % All runs succeeded — show longest intercept as "worst"
+                if Tr_scan.Duration > Worst_Dur
+                    Worst_Dur = Tr_scan.Duration;
+                    Worst_Run = r_scan;
+                end
+            end
+        end
+
+        Tr = Trajectory_Results{ni, ai, Worst_Run};
+
+        Tile_Axis = nexttile(Worst_Layout);
+        hold(Tile_Axis, 'on');
+        axis(Tile_Axis, 'equal');
+        grid(Tile_Axis, 'on');
+        set(Tile_Axis, 'Color', [0.05 0.05 0.05], 'GridColor', [0.25 0.25 0.25]);
+
+        % Draw obstacles
+        for obs_i = 1:length(Tr.Obs_Radius)
+            th_obs = linspace(0, 2*pi, 40);
+            fill(Tile_Axis, Tr.Obs_Center(1,obs_i) + Tr.Obs_Radius(obs_i)*cos(th_obs), Tr.Obs_Center(2,obs_i) + Tr.Obs_Radius(obs_i)*sin(th_obs), [0.55 0.55 0.55], 'EdgeColor', [0.4 0.4 0.4], 'FaceAlpha', 0.8);
+        end
+
+        if Tr.Hit_Obstacle
+            Plane_Color = [1.0 0.5 0.0];   % orange = collision
+        elseif Tr.Intercept
+            Plane_Color = [0.0 0.85 0.2];  % green = slowest success
+        else
+            Plane_Color = [0.9 0.2 0.1];   % red = failure
+        end
+
+        plot(Tile_Axis, Tr.Missile_X, Tr.Missile_Y, '-', 'Color', [0.0 0.7 0.9], 'LineWidth', 1.5);
+        plot(Tile_Axis, Tr.Plane_X,   Tr.Plane_Y,   '-', 'Color', Plane_Color,   'LineWidth', 1.5);
+
+        plot(Tile_Axis, Tr.Missile_X(1), Tr.Missile_Y(1), 'o', 'Color', [0.0 0.7 0.9], 'MarkerFaceColor', [0.0 0.7 0.9], 'MarkerSize', 4);
+        plot(Tile_Axis, Tr.Plane_X(1),   Tr.Plane_Y(1),   's', 'Color', Plane_Color,   'MarkerFaceColor', Plane_Color,   'MarkerSize', 4);
+
+        All_X = [Tr.Missile_X, Tr.Plane_X];
+        All_Y = [Tr.Missile_Y, Tr.Plane_Y];
+        if ~isempty(All_X)
+            X_Pad = max((max(All_X)-min(All_X))*0.06, 15);
+            Y_Pad = max((max(All_Y)-min(All_Y))*0.06, 15);
+            xlim(Tile_Axis, [min(All_X)-X_Pad, max(All_X)+X_Pad]);
+            ylim(Tile_Axis, [min(All_Y)-Y_Pad, max(All_Y)+Y_Pad]);
+        end
+
+        if Tr.Hit_Obstacle
+            Status_Str = sprintf('COLLISION %.1fs', Tr.Duration);
+        elseif Tr.Intercept
+            Status_Str = sprintf('slow %.1fs', Tr.Duration);
+        else
+            Status_Str = sprintf('fail %.1fs', Tr.Duration);
+        end
+        title(Tile_Axis, sprintf('N=%.1f APF=%.1f | %.0f%% | %s', Nav_Values(ni), APF_Values(ai), Success_Grid(ni,ai), Status_Str), 'FontSize', 7, 'Color', 'k');
+        set(Tile_Axis, 'XTickLabel', [], 'YTickLabel', []);
+    end
+end
+
+end % End batch tuning
+
+function R = Run_Single_Sim(Navigation_Constant, APF_Weight_Scale, Plane_Speed, Missile_Speed, Max_Time, Num_Obstacles_Target, Missile_G_Max, Capture_Radius, Seed, Params)
+
+rng(Seed);   % single seed, one stream, all randomness flows from here
+
+Delta_Time              = Params.Delta_Time;
+Plane_Heading           = rand() * 2 * pi;   % draw 1: heading
+Plane_Max_Turn_Rate     = Params.Plane_Max_Turn_Rate;
+Plane_Noise_Weight      = Params.Plane_Noise_Weight;
+Close_Range             = Params.Close_Range;
+Jink_Period             = Params.Jink_Period;
+Missile_Start           = Params.Missile_Start;
+Missile_Boundary_Margin = Params.Missile_Boundary_Margin;
+Missile_Boundary_Gain   = Params.Missile_Boundary_Gain;
+Boundary_Margin         = Params.Boundary_Margin;
+Gain_Repulsive          = Params.Gain_Repulsive;
+Influence_Radius        = Params.Influence_Radius;
+Arena_Buffer            = Params.Arena_Buffer;
+Min_Separation          = Params.Min_Separation;
+
+while true                                    % draw 2+: plane start
+    Plane_Start = randi([50, 900], 2, 1);
+    while norm(Plane_Start - Missile_Start) < 150
+        Plane_Start = randi([50, 900], 2, 1);
+    end
+    if norm(Plane_Start - Missile_Start) > Min_Separation
+        break;
+    end
+end
+
+Initial_Separation       = norm(Plane_Start - Missile_Start);
+Closing_Speed_Estimate   = max(Missile_Speed - Plane_Speed, 0.1);
+Estimated_Intercept_Time = Initial_Separation / Closing_Speed_Estimate;
+Arena_Size = ceil(max([Missile_Start; Plane_Start])) + ceil(max(Missile_Speed, Plane_Speed) * Estimated_Intercept_Time) + Arena_Buffer;
+
+Obs_Radius_Min = 5; Obs_Radius_Max = 50;
+Obstacle_Center = zeros(2, Num_Obstacles_Target);
+Obstacle_Radius = zeros(1, Num_Obstacles_Target);
+Clearance = 20.0; Count = 0; Attempts = 0;
+
+while Count < Num_Obstacles_Target && Attempts < 5000
+    Attempts = Attempts + 1;
+    Rad = Obs_Radius_Min + (Obs_Radius_Max - Obs_Radius_Min) * rand();
+    Cx  = Rad + (Arena_Size - 2*Rad) * rand();
+    Cy  = Rad + (Arena_Size - 2*Rad) * rand();
+    C   = [Cx; Cy];
+    if norm(C - Missile_Start) < Clearance + Rad, continue; end
+    if norm(C - Plane_Start)   < Clearance + Rad, continue; end
+    Overlap = false;
+    for k = 1:Count
+        if norm(C - Obstacle_Center(:,k)) < Rad + Obstacle_Radius(k) + 4
+            Overlap = true;
+            break;
+        end
+    end
+    if Overlap, continue; end
+    Count = Count + 1;
+    Obstacle_Center(:,Count) = C;
+    Obstacle_Radius(Count)   = Rad;
+end
+Num_Obstacles = Count;
+
+Missile_Position    = Missile_Start;
+Plane_Position      = Plane_Start;
+Plane_Velocity      = Plane_Speed * [cos(Plane_Heading); sin(Plane_Heading)];
+Plane_Noise_Angle   = 0.0;
+Smoothed_Evasion    = [cos(Plane_Heading); sin(Plane_Heading)];
+Initial_Vector      = Plane_Start - Missile_Start;
+Missile_Heading     = atan2(Initial_Vector(2), Initial_Vector(1));
+Last_Plane_Position = Plane_Position;
+Last_Plane_Velocity = Plane_Velocity;
+Occlusion_Timer     = 0.0;
+
+Max_Steps     = ceil(Max_Time / Delta_Time);
+Log_Distance  = nan(1, Max_Steps);
+Log_Missile_G = nan(1, Max_Steps);
+Log_Missile_X = nan(1, Max_Steps);
+Log_Missile_Y = nan(1, Max_Steps);
+Log_Plane_X   = nan(1, Max_Steps);
+Log_Plane_Y   = nan(1, Max_Steps);
+
+Step         = 0;
+Current_Time = 0.0;
+Intercept    = false;
+Hit_Obstacle = false;
+Keep_Running = true;
+
+while Keep_Running && Step < Max_Steps
+    Step         = Step + 1;
+    Current_Time = Step * Delta_Time;
+
+    Missile_to_Plane_Vector      = Plane_Position - Missile_Position;
+    Missile_to_Plane_Distance = norm(Missile_to_Plane_Vector) + 1e-9;
+    LOS_Unit = Missile_to_Plane_Vector / Missile_to_Plane_Distance;
+
+    Boundary_Force    = [0;0];
+    Boundary_Force(1) = Boundary_Force(1) + max(0, 1 - Plane_Position(1)/Boundary_Margin);
+    Boundary_Force(1) = Boundary_Force(1) - max(0, 1 - (Arena_Size-Plane_Position(1))/Boundary_Margin);
+    Boundary_Force(2) = Boundary_Force(2) + max(0, 1 - Plane_Position(2)/Boundary_Margin);
+    Boundary_Force(2) = Boundary_Force(2) - max(0, 1 - (Arena_Size-Plane_Position(2))/Boundary_Margin);
+
+    Plane_Obstacle_Force = [0;0];
+    for i = 1:Num_Obstacles
+        Vec_Away = Plane_Position - Obstacle_Center(1:2,i);
+        Dist_Center = norm(Vec_Away)+1e-9;
+        Dist_Surface = max(Dist_Center - Obstacle_Radius(i), 0.01);
+        if Dist_Surface < Influence_Radius
+            Plane_Obstacle_Force = Plane_Obstacle_Force + 300*(1/Dist_Surface - 1/Influence_Radius)/Dist_Surface^2 * (Vec_Away/Dist_Center);
+        end
+    end
+
+    Perp_A = [-LOS_Unit(2); LOS_Unit(1)];
+    Perp_B = [ LOS_Unit(2);-LOS_Unit(1)];
+    Current_Direction   = [cos(Plane_Heading); sin(Plane_Heading)];
+    if dot(Perp_A, Current_Direction) >= dot(Perp_B, Current_Direction)
+        Base_Beam_Direction = Perp_A;
+    else
+        Base_Beam_Direction = Perp_B;
+    end
+    Jink_Bias         = 0.65 + 0.35*sin(2*pi*Current_Time/Jink_Period);
+    Beam_Dir          = Jink_Bias * Base_Beam_Direction / (norm(Jink_Bias * Base_Beam_Direction)+1e-9);
+    Away_Weight       = max(0.15, 0.9*(1 - Missile_to_Plane_Distance/Close_Range));
+    Plane_Noise_Angle = 0.96*Plane_Noise_Angle + 0.04*randn();
+    Noise_Direction         = [cos(Plane_Noise_Angle); sin(Plane_Noise_Angle)];
+
+    Plane_Evasion_Vector               = 0.6*Beam_Dir + Away_Weight*LOS_Unit + Plane_Noise_Weight*Noise_Direction + 1.5*Boundary_Force + 0.6*Plane_Obstacle_Force;
+    Smoothed_Evasion = 0.92*Smoothed_Evasion + 0.08*Plane_Evasion_Vector;
+    Plane_Desired_Direction              = Smoothed_Evasion / (norm(Smoothed_Evasion)+1e-9);
+    Plane_Desired_Heading              = atan2(Plane_Desired_Direction(2), Plane_Desired_Direction(1));
+    Plane_Heading_Error              = atan2(sin(Plane_Desired_Heading-Plane_Heading), cos(Plane_Desired_Heading-Plane_Heading));
+    Plane_Heading    = Plane_Heading + sign(Plane_Heading_Error)*min(abs(Plane_Heading_Error), Plane_Max_Turn_Rate*Delta_Time);
+    Plane_Velocity   = Plane_Speed * [cos(Plane_Heading); sin(Plane_Heading)];
+    Plane_Position   = Plane_Position + Plane_Velocity * Delta_Time;
+
+    LOS_Blocked = false;
+    for i = 1:Num_Obstacles
+        Segment_Vec   = Plane_Position - Missile_Position;
+        To_Obstacle   = Obstacle_Center(1:2,i) - Missile_Position;
+        Projection = dot(To_Obstacle,Segment_Vec)/(dot(Segment_Vec,Segment_Vec)+1e-9);
+        Projection = max(0,min(1,Projection));
+        Closest_Point   = Missile_Position + Projection*Segment_Vec;
+        if norm(Obstacle_Center(:,i)-Closest_Point) < Obstacle_Radius(i)
+            LOS_Blocked = true; break;
+        end
+    end
+
+    if ~LOS_Blocked
+        Guidance_Target_Position = Plane_Position;
+        Guidance_Target_Velocity = Plane_Velocity;
+        Last_Plane_Position      = Plane_Position;
+        Last_Plane_Velocity      = Plane_Velocity;
+        Occlusion_Timer          = 0.0;
+        Using_PN                 = true;
+    else
+        Occlusion_Timer          = Occlusion_Timer + Delta_Time;
+        Prediction_Time          = min(Occlusion_Timer, 4.0);
+        Guidance_Target_Position = Last_Plane_Position + Last_Plane_Velocity * Prediction_Time;
+        Guidance_Target_Velocity = Last_Plane_Velocity;
+        Using_PN                 = false;
+    end
+
+    Missile_Velocity  = Missile_Speed * [cos(Missile_Heading); sin(Missile_Heading)];
+    Relative_Position = Guidance_Target_Position - Missile_Position;
+    Relative_Distance = norm(Relative_Position) + 1e-9;
+    LOS_Unit        = Relative_Position / Relative_Distance;
+    Relative_Velocity = Guidance_Target_Velocity - Missile_Velocity;
+    Closing_Velocity  = max(-dot(Relative_Velocity, LOS_Unit), 0);
+
+    Log_Missile_X(Step) = Missile_Position(1);
+    Log_Missile_Y(Step) = Missile_Position(2);
+    Log_Plane_X(Step)   = Plane_Position(1);
+    Log_Plane_Y(Step)   = Plane_Position(2);
+
+    if Using_PN
+        LOS_Rate    = (Relative_Position(1)*Relative_Velocity(2) - Relative_Position(2)*Relative_Velocity(1)) / Relative_Distance^2;
+        A_PN        = Navigation_Constant * Closing_Velocity * LOS_Rate * [-LOS_Unit(2); LOS_Unit(1)];
+        Desired_Direction = Relative_Position / Relative_Distance;
+        Current_Direction = [cos(Missile_Heading); sin(Missile_Heading)];
+        A_Guidance  = A_PN + 0.8 * Missile_Speed * (Desired_Direction - Current_Direction);
+    else
+        Desired_Direction = Relative_Position / Relative_Distance;
+Current_Direction = [cos(Missile_Heading); sin(Missile_Heading)];
+A_Guidance = 0.8 * Missile_Speed * (Desired_Direction - Current_Direction);
+    end
+
+    Force_Boundary = [0;0];
+    d = max(Missile_Position(1), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(1) = Force_Boundary(1) + Missile_Boundary_Gain*(1/d - 1/Missile_Boundary_Margin)/d^2;
+    end
+    d = max(Arena_Size-Missile_Position(1), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(1) = Force_Boundary(1) - Missile_Boundary_Gain*(1/d - 1/Missile_Boundary_Margin)/d^2;
+    end
+    d = max(Missile_Position(2), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(2) = Force_Boundary(2) + Missile_Boundary_Gain*(1/d - 1/Missile_Boundary_Margin)/d^2;
+    end
+    d = max(Arena_Size-Missile_Position(2), 0.01);
+    if d < Missile_Boundary_Margin
+        Force_Boundary(2) = Force_Boundary(2) - Missile_Boundary_Gain*(1/d - 1/Missile_Boundary_Margin)/d^2;
+    end
+
+    Force_Repulsive = [0;0];
+    Min_Obs_Dist    = inf;
+    for i = 1:Num_Obstacles
+        Vec_Away = Missile_Position - Obstacle_Center(1:2,i);
+        Dist_Center  = norm(Vec_Away) + 1e-9;
+        Dist_Surface = max(Dist_Center - Obstacle_Radius(i), 0.01);
+        Min_Obs_Dist = min(Min_Obs_Dist, Dist_Surface);
+        Effective_Influence = Influence_Radius * 1.5;
+        if Dist_Surface < Effective_Influence
+            Unit_Away = Vec_Away / Dist_Center;
+            Perp_Left = [-Unit_Away(2);  Unit_Away(1)];
+            Perp_Right = [ Unit_Away(2); -Unit_Away(1)];
+            To_Target = Guidance_Target_Position - Missile_Position;
+            if dot(To_Target, Perp_Left) >= dot(To_Target, Perp_Right)
+                Dodge = Perp_Left;
+            else
+                Dodge = Perp_Right;
+            end
+            Rep_Mag         = Gain_Repulsive * 1.5 * (1/Dist_Surface - 1/Effective_Influence) / Dist_Surface^2;
+            Force_Repulsive = Force_Repulsive + Rep_Mag*(0.5*Unit_Away + 0.5*Dodge);
+        end
+    end
+
+    % Obstacle collision check
+    for i = 1:Num_Obstacles
+        if norm(Missile_Position - Obstacle_Center(1:2,i)) <= Obstacle_Radius(i)
+            Hit_Obstacle = true; Keep_Running = false; break;
+        end
+    end
+
+    A_APF = Force_Repulsive + Force_Boundary;
+    if norm(A_APF) > 80
+        A_APF = 80 * A_APF / norm(A_APF);
+    end
+
+    % Wider detection + stronger repulsion for batch sim
+    if Min_Obs_Dist < Influence_Radius * 1.5
+        APF_W = APF_Weight_Scale * (1.0 + (Influence_Radius * 1.5 - Min_Obs_Dist) / (Influence_Radius * 1.5));
+        APF_W = min(APF_W, 3.0);   % cap to prevent runaway
+    else
+        APF_W = 0;
+    end
+
+    A_Command = A_Guidance + APF_W * A_APF;
+    Max_Total_Accel = Missile_G_Max * 9.81;
+
+    if norm(A_Command) > Max_Total_Accel
+        A_Command = Max_Total_Accel * A_Command / norm(A_Command);
+    end
+
+    A_Lateral         = dot(A_Command, [-sin(Missile_Heading); cos(Missile_Heading)]);
+    Turn_Rate_Command = A_Lateral / Missile_Speed;
+    Max_Turn_Rate     = Missile_G_Max * 9.81 / Missile_Speed;
+    Turn_Rate         = max(min(Turn_Rate_Command, Max_Turn_Rate), -Max_Turn_Rate);
+    Missile_Heading   = Missile_Heading + Turn_Rate * Delta_Time;
+    Missile_G         = abs(Turn_Rate) * Missile_Speed / 9.81;
+
+    Missile_Position(1) = Missile_Position(1) + Missile_Speed*cos(Missile_Heading)*Delta_Time;
+    Missile_Position(2) = Missile_Position(2) + Missile_Speed*sin(Missile_Heading)*Delta_Time;
+
+    Current_Distance    = norm(Missile_Position - Plane_Position);
+    Log_Distance(Step)  = Current_Distance;
+    Log_Missile_G(Step) = Missile_G;
+
+    if Current_Distance <= Capture_Radius
+        Intercept = true; Keep_Running = false;
+    end
+    if any(Missile_Position < 0) || any(Missile_Position > Arena_Size)
+        Keep_Running = false;
+    end
+    if Missile_G >= Missile_G_Max && Step > 1 && ~Intercept
+        Keep_Running = false;
+    end
+end
+
+R.Intercept      = Intercept;
+R.Hit_Obstacle   = Hit_Obstacle;
+R.Final_Distance = Log_Distance(Step);
+R.Max_G          = max(Log_Missile_G, [], 'omitnan');
+R.Duration       = Current_Time;
+R.Missile_X      = Log_Missile_X(1:Step);
+R.Missile_Y      = Log_Missile_Y(1:Step);
+R.Plane_X        = Log_Plane_X(1:Step);
+R.Plane_Y        = Log_Plane_Y(1:Step);
+R.Obs_Center     = Obstacle_Center;
+R.Obs_Radius     = Obstacle_Radius;
+end
+
+function Flags = FlagToggleGUI(Flags)
+
+Fig = uifigure('Name', 'Simulation Toggles', 'Position', [600 250 420 430], 'Resize', 'on');
+
+fields = fieldnames(Flags);
+Num_Fields = length(fields);
+
+Grid = uigridlayout(Fig, [Num_Fields + 1, 2]);
+Grid.RowHeight = [repmat({32}, 1, Num_Fields), {45}];
+Grid.ColumnWidth = {'1x', 90};
+Grid.Padding = [15 15 15 15];
+Grid.RowSpacing = 6;
+
+for i = 1:Num_Fields
+    Field_Name = fields{i};
+
+    Label = uilabel(Grid, 'Text', strrep(Field_Name, '_', ' '), 'FontSize', 12);
+
+    Label.Layout.Row = i;
+    Label.Layout.Column = 1;
+
+    Switch = uiswitch(Grid, 'slider', 'Items', {'false', 'true'}, 'Value', string(Flags.(Field_Name)));
+
+    Switch.Layout.Row = i;
+    Switch.Layout.Column = 2;
+
+    Switch.ValueChangedFcn = @(src, event) updateFlag(src, Field_Name);
+end
+
+Run_Button = uibutton(Grid, 'Text', 'Save & Run', 'ButtonPushedFcn', @(src,event) uiresume(Fig));
+
+Run_Button.Layout.Row = Num_Fields + 1;
+Run_Button.Layout.Column = [1 2];
+
+uiwait(Fig);
+
+if isvalid(Fig)
+    save('SimFlags.mat', 'Flags');
+    delete(Fig);
+end
+
+    function updateFlag(src, name)
+    Flags.(name) = strcmp(src.Value, 'true');
+end
+
+end
+
+
+function Vout = TransformSAMSTL2D(V, Position, Heading, Scale)
+
+V = V(:, [1 3 2]);   
+
+V = V * Scale;
+
+R = [cos(Heading), -sin(Heading), 0;
+    sin(Heading),  cos(Heading), 0;
+    0,             0,            1];
+
+V = V * R';
+
+Vout = V + [Position(1), Position(2), 0];
+
+end
